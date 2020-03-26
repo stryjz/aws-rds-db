@@ -1,0 +1,10 @@
+dbname: stryjz
+user: admin-user
+rouser: test-user-ro
+owner: admin-user@stryjz.biz
+vault_policies:
+  - name: stryjz
+    rules:
+      path:
+        "secret/stryjz/*":
+          policy: read

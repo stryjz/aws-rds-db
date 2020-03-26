@@ -1,0 +1,44 @@
+---
+- include_vars:
+    dir: "../vars/{{ env }}/group_vars/all/"
+
+- name: Revoke all on database postgres from PUBLIC
+  postgresql_privs:
+    state: absent
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: postgres
+    privs: CONNECT
+    type: database
+    objs: postgres
+    roles: PUBLIC
+    grant_option: no
+
+- name: Revoke all on database template0 from PUBLIC
+  postgresql_privs:
+    state: absent
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: postgres
+    privs: CONNECT
+    type: database
+    objs: template0
+    roles: PUBLIC
+    grant_option: no
+
+- name: Revoke all on database template1 from PUBLIC
+  postgresql_privs:
+    state: absent
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: postgres
+    privs: CONNECT
+    type: database
+    objs: template1
+    roles: PUBLIC
+    grant_option: no
+
+

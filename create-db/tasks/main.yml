@@ -1,0 +1,10 @@
+---
+
+- include_tasks: create-db.yml
+  with_fileglob: "../vars/{{ env }}/*.yml"
+  loop_control:
+    loop_var: postgresql_file
+  when: "env in ['dev','prd'] "
+
+- include_tasks: db-privs.yml
+  when: "env in ['dev','prd']"

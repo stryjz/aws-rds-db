@@ -1,0 +1,312 @@
+---
+
+- include_vars:
+    file: "{{ postgresql_file }}"
+    name: postgresql_data
+
+- include_vars:
+    dir: "../vars/{{ env }}/group_vars/all"
+
+- name: Create DB {{ postgresql_data.dbname }}
+  postgresql_db:
+    name: "{{ postgresql_data.dbname }}"
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+  register: dbcreated
+
+- name: Generate password for user {{ postgresql_data.user }}
+  shell: openssl rand -base64 16
+  register: user_password
+  when: dbcreated.changed == true
+
+- name: Create fullaccess user {{ postgresql_data.user }}
+  postgresql_user:
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    db: "{{ postgresql_data.dbname }}"
+    no_password_changes: yes
+    name: "{{ postgresql_data.user }}"
+    password: "{{ user_password.stdout }}"
+    role_attr_flags: LOGIN
+    state: present
+  register: result
+  when: dbcreated.changed == true
+
+- name: Generate password for user {{ postgresql_data.rouser }}
+  shell: openssl rand -base64 16
+  register: ro_user_password
+  when: dbcreated.changed == true
+
+- name: Create readonly user {{ postgresql_data.rouser }}
+  postgresql_user:
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    db: "{{ postgresql_data.dbname }}"
+    no_password_changes: yes
+    name: "{{ postgresql_data.rouser }}"
+    password: "{{ ro_user_password.stdout }}"
+    role_attr_flags: LOGIN
+    state: present
+  register: ro_result
+  when: dbcreated.changed == true
+
+- name: Set policy for new secret
+  run_once: yes
+  hashivault_policy_set:
+    url: "{{ hashi_vault_url }}"
+    verify: no
+    token: "{{ root_token }}"
+    name: "{{ item.name }}"
+    rules: "{{ item.rules | to_json }}"
+  loop: "{{ postgresql_data.vault_policies }}"
+
+- name: Store full access user and password in vault {{ postgresql_data.user }}
+  no_log: false
+  run_once: true
+  diff: no
+  hashivault_write:
+    url: "{{ hashi_vault_url }}"
+    verify: no
+    token: "{{ root_token }}"
+    update: true
+    secret: "{{ postgresql_data.dbname }}/rds/{{ postgresql_data.user }}"
+    data:
+      db: "{{ postgresql_data.dbname }}"
+      username: "{{ postgresql_data.user }}"
+      password: "{{ user_password.stdout }}"
+  when: result.changed
+
+- name: Store read only user and password in vault {{ postgresql_data.rouser }}
+  no_log: false
+  run_once: true
+  diff: no
+  hashivault_write:
+    url: "{{ hashi_vault_url }}"
+    verify: no
+    token: "{{ root_token }}"
+    update: true
+    secret: "{{ postgresql_data.dbname }}/rds/{{ postgresql_data.rouser }}"
+    data:
+      db: "{{ postgresql_data.dbname }}"
+      username: "{{ postgresql_data.rouser }}"
+      password: "{{ ro_user_password.stdout }}"
+  when: ro_result.changed
+
+- set_fact:
+    space: "  "
+
+- name: Append vault policies
+  blockinfile:
+    marker: "#{{ postgresql_data.dbname }} {mark}"
+    dest: "{{ playbook_dir | regex_replace ('(infrastructure)', 'provisioning') }}/global-vars/hashi-vault-policies/policies.yml"
+    insertafter: EOF
+    state: present
+    block: |
+     {{ space }}- name: {{ postgresql_data.dbname }}
+         rules:
+           path:
+             "secret/{{ postgresql_data.dbname }}/*":
+               policy: read
+
+- name: Revoke create on schema public from PUBLIC
+  postgresql_privs:
+    state: absent
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: CREATE
+    type: schema
+    objs: public
+    roles: PUBLIC
+    grant_option: no
+
+- name: Create readonly role
+  postgresql_user:
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    db: "{{ postgresql_data.dbname }}"
+    no_password_changes: yes
+    name: readonly
+    role_attr_flags: NOLOGIN
+    state: present
+
+- name: Revoke all on database {{ postgresql_data.dbname }} from PUBLIC,readonly
+  postgresql_privs:
+    state: absent
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: CONNECT
+    type: database
+    objs: "{{ postgresql_data.dbname }}"
+    roles: "{{ item }}"
+    grant_option: no
+  with_items:
+    - PUBLIC
+    - readonly
+
+- name: Grant usage on schema public to readonly
+  postgresql_privs:
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: USAGE
+    type: schema
+    objs: public
+    roles: readonly
+    grant_option: yes
+
+- name: Grant connect on database {{ postgresql_data.dbname }} to user
+  postgresql_privs:
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: CONNECT
+    type: database
+    objs: "{{ postgresql_data.dbname }}"
+    roles: "{{ postgresql_data.rouser }},{{ postgresql_data.user }}"
+    grant_option: yes
+
+- name: Alter default priviliges in schema public grant select on tables to readonly
+  command: "psql -h {{ rds_url }} -d {{ postgresql_data.dbname }} -U devops -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly'"
+  environment:
+    PGPASSWORD: "{{ masterpass }}"
+  when: result.changed
+
+- name: Grant readonly to {{ postgresql_data.rouser }}
+  postgresql_privs:
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    type: group
+    objs: readonly
+    roles: "{{ postgresql_data.rouser }}"
+    grant_option: yes
+
+- name: Grant ALL priviliges to user {{ postgresql_data.user }}
+  postgresql_privs:
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: ALL
+    type: database
+    objs: "{{ postgresql_data.dbname }}"
+    roles: "{{ postgresql_data.user }}"
+    grant_option: yes
+
+- name: Grant create on schema public to {{ postgresql_data.user }}
+  postgresql_privs:
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: CREATE
+    type: schema
+    objs: public
+    roles: "{{ postgresql_data.user }}"
+    grant_option: yes
+
+- name: Grant select on all tables in schema public to readonly
+  postgresql_privs:
+    state: present
+    login_host: "{{ rds_url }}"
+    login_password: "{{ masterpass }}"
+    login_user: devops
+    database: "{{ postgresql_data.dbname }}"
+    privs: SELECT
+    objs: ALL_IN_SCHEMA
+    roles: readonly
+    grant_option: yes
+
+- name: Read password {{ postgresql_data.rouser }}
+  hashivault_read:
+    url: "{{ hashi_vault_url }}"
+    verify: no
+    token: "{{ root_token }}"
+    secret: "{{ postgresql_data.dbname }}/rds/{{ postgresql_data.rouser }}"
+    key: password
+  register: key
+
+- set_fact:
+    keys: "{{ key.value }}"
+
+- name: Create token
+  hashivault_token_create:
+    display_name: "{{ postgresql_data.dbname }}"
+    policies: ["{{ postgresql_data.dbname }}"]
+    renewable: True
+    url: "{{ hashi_vault_url }}"
+    verify: no
+    ttl: 691200
+    token: "{{ root_token }}"
+  register: vault_token
+  when:
+    - ro_result.changed
+    - env in ['dev']
+
+- name: Sending an e-mail using SES
+  mail:
+    host: "{{ ses_server }}"
+    from: dontreply@stryjz.biz
+    port: 587
+    secure: starttls
+    username: "{{ ses_user }}"
+    password: "{{ ses_password }}"
+    to: "{{ postgresql_data.owner }}"
+    subject: "{{ postgresql_data.dbname }} database setup"
+    body: "
+        Database name: {{ postgresql_data.dbname }}\n
+        Full Access user: {{ postgresql_data.user }}\n
+        Vault token: {{ vault_token.token.auth.client_token }} \n
+        Read only user: {{ postgresql_data.rouser }}\n
+        Read only user password: {{ keys }}\n
+        URL: {{ rds_url }}\n
+        Vault paths to get users data:\n
+        secret/{{ postgresql_data.dbname }}/rds/{{ postgresql_data.user }}\n
+        secret/{{ postgresql_data.dbname }}/rds/{{ postgresql_data.rouser }}\n
+        "
+  delegate_to: localhost
+  when:
+    - ro_result.changed
+    - env in ['dev']
+
+- name: Sending an e-mail using SES
+  mail:
+    host: "{{ ses_server }}"
+    from: dontreply@stryjz.biz
+    port: 587
+    secure: starttls
+    username: "{{ ses_user }}"
+    password: "{{ ses_password }}"
+    to: "{{ postgresql_data.owner }}"
+    subject: "{{ postgresql_data.dbname }} database setup"
+    body: "
+        Database name: {{ postgresql_data.dbname }}\n
+        Full Access user: {{ postgresql_data.user }}\n
+        Read only user: {{ postgresql_data.rouser }}\n
+        Read only user password: {{ keys }}\n
+        URL: {{ rds_url }}\n
+        Vault paths to get users data:\n
+        secret/{{ postgresql_data.dbname }}/rds/{{ postgresql_data.user }}\n
+        secret/{{ postgresql_data.dbname }}/rds/{{ postgresql_data.rouser }}\n
+        "
+  delegate_to: localhost
+  when:
+    - ro_result.changed
+    - env in ['prd']
